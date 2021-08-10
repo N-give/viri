@@ -1,0 +1,14 @@
+[package]
+name = "viri"
+version = "0.1.0"
+authors = ["Nathan Givens <nate.givens03@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.42"
+mio = { version = "0.7.13", features = [ "os-poll", "os-ext" ] }
+phf = { version = "0.8.0", features = [ "macros" ] }
+termion = "1.5.6"
+tokio = { version = "1.9.0", features = [ "full" ] }
