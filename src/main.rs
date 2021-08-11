@@ -1,3 +1,4 @@
+mod child;
 mod config;
 mod lib;
 
@@ -13,46 +14,17 @@ use std::{
 use termion::{
     clear, cursor, input::TermRead, raw::IntoRawMode, terminal_size,
 };
+use tokio::sync::mpsc::unbounded_channel;
 
 fn main() -> Result<(), Box<dyn error::Error + 'static>> {
     let args: Vec<String> = env::args().skip(1).collect();
     let term_in = stdin();
     let mut output = stdout().into_raw_mode()?;
 
-    let mut child = Command::new(&args[0]);
-    child.stdout(Stdio::piped());
-    // child.stderr(Stdio::piped());
-    child.stdin(Stdio::piped());
-    let mut child = child.spawn()?;
-
-    let mut c_stdout = BufReader::new(
-        child.stdout.take().expect("failed to get child stdout"),
-    );
-    // let mut c_stderr = BufReader::new(
-    //     child.stderr.take().expect("faild to take child stderr"),
-    // );
-    let mut c_stdin =
-        BufWriter::new(child.stdin.take().expect("failed to get child stdin"));
-
-    let (output_send, output_recv) = mpsc::channel();
-    // let (err_send, err_recv) = std::sync::mpsc::channel();
-    let (kill, die) = mpsc::channel::<()>();
+    let (child_send, child_recv) = unbounded_channel();
 
     let output_t = std::thread::spawn(move || -> Result<()> {
-        loop {
-            if let Ok(_) = die.try_recv() {
-                break;
-            }
-
-            match c_stdout.read_line() {
-                Ok(Some(buf)) => {
-                    output_send.send(buf)?;
-                }
-                Ok(None) => break,
-                Err(_e) => break,
-            }
-        }
-        Ok(())
+        child::run_child(args[0].clone(), &args[1..], child_recv)
     });
 
     // let error_t = std::thread::spawn(move || -> Result<()> {
@@ -88,25 +60,13 @@ fn main() -> Result<(), Box<dyn error::Error + 'static>> {
     // loop {
     for event in term_in.events() {
         let event = event?;
-        if let Ok(out) = output_recv.try_recv() {
-            state.output.push(out);
-            print_buffer(&mut output, &state)?;
-        }
-
-        /*
-        if let Ok(e) = err_recv.try_recv() {
-            state.error = e;
-            print_buffer(&mut output, &state).unwrap();
-        }
-        */
-
         state = match state.mode {
             Mode::Execute => {
-                c_stdin.write_all(
-                    format!("{}{}\n", state.input_before, state.input_after)
-                        .as_bytes(),
-                )?;
-                c_stdin.flush()?;
+                let cin =
+                    format!("{}{}\n", state.input_before, state.input_after);
+
+                child_send.send(child::Message::Exec(cin))?;
+
                 State {
                     mode: Mode::Normal,
                     input_before: String::new(),
@@ -119,19 +79,34 @@ fn main() -> Result<(), Box<dyn error::Error + 'static>> {
             Mode::Normal => normal_mode(event, state),
             Mode::Quit => break,
         };
-        print_buffer(&mut output, &state).unwrap();
+
+        print_buffer(&mut output, &state)?;
+
+        state = match state.mode {
+            Mode::Execute => {
+                let cin =
+                    format!("{}{}\n", state.input_before, state.input_after);
+
+                child_send.send(child::Message::Exec(cin))?;
+
+                State {
+                    mode: Mode::Normal,
+                    input_before: String::new(),
+                    input_after: String::new(),
+                    ..state
+                }
+            }
+            Mode::Quit => break,
+            _ => state,
+        }
     }
 
-    kill.send(())?;
-    child.kill()?;
+    child_send.send(child::Message::Kill)?;
     output_t.join().unwrap()?;
-
-    // output_t.join().expect("failed to join output thread")?;
-    // error_t.join().expect("failed to join error thread")?;
 
     write!(
         output,
-        "\n{}{}finished\n",
+        "\n{}{}finished\n\r",
         clear::CurrentLine,
         cursor::Goto(1, state.size.1),
     )?;
