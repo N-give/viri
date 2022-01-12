@@ -1,30 +1,52 @@
 mod child;
 mod config;
-mod lib;
+mod cursor;
+mod output;
+mod state;
 
 use anyhow::Result;
 use config::get_config;
-use lib::{command_mode, insert_mode, normal_mode, Mode, State};
+use cursor::Cursor;
+use mio::{unix::SourceFd, Events, Interest, Poll, Token};
+// use output::{print_buffer, OutputType};
+use state::{
+    command_mode, insert_mode, normal_mode, History, Mode, Source, State,
+};
 use std::{
     env, error,
-    io::{stdin, stdout, BufReader, BufWriter, Stdout, Write},
-    process::{Command, Stdio},
-    sync::mpsc,
+    io::{stdin, stdout, Write},
+    os::unix::prelude::AsRawFd,
+    sync::mpsc::channel,
+    time::Duration,
 };
 use termion::{
-    clear, cursor, input::TermRead, raw::IntoRawMode, terminal_size,
+    clear,
+    // event::{Event, Key},
+    input::TermRead,
+    raw::IntoRawMode,
+    terminal_size,
 };
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::{runtime::Runtime, sync::mpsc::unbounded_channel};
 
 fn main() -> Result<(), Box<dyn error::Error + 'static>> {
     let args: Vec<String> = env::args().skip(1).collect();
     let term_in = stdin();
+    let mut term_events = stdin().events();
     let mut output = stdout().into_raw_mode()?;
 
     let (child_send, child_recv) = unbounded_channel();
+    let (parent_send, parent_recv) = channel();
 
+    let rt = Runtime::new()?;
+    // let handle = rt.handle().clone();
     let output_t = std::thread::spawn(move || -> Result<()> {
-        child::run_child(args[0].clone(), &args[1..], child_recv)
+        child::run_child(
+            args[0].clone(),
+            &args[1..],
+            child_recv,
+            parent_send,
+            &rt,
+        )
     });
 
     // let error_t = std::thread::spawn(move || -> Result<()> {
@@ -44,102 +66,149 @@ fn main() -> Result<(), Box<dyn error::Error + 'static>> {
     let mut state: State = State {
         mode: Mode::Normal,
         size,
-        input_before: String::new(),
-        input_after: String::new(),
-        cmd_before: String::new(),
-        cmd_after: String::new(),
-        output: Vec::with_capacity(size.0 as usize),
-        error: String::new(),
+        input: Cursor::new(),
+        command: Cursor::new(),
         keys: get_config("_filename")?,
-        previous: Vec::with_capacity(100),
+        history: History::new(),
     };
 
     write!(output, "{}", clear::All)?;
     output.flush()?;
 
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(128);
+
+    const TERM_EVENT: Token = Token(0);
+
+    poll.registry().register(
+        &mut SourceFd(&term_in.as_raw_fd()),
+        TERM_EVENT,
+        Interest::READABLE,
+    )?;
+
+    'main: loop {
+        if let Mode::Quit = state.mode {
+            break 'main;
+        }
+
+        if let Ok(cout) = parent_recv.try_recv() {
+            state
+                .history
+                .push(Source::ChildOutput(Cursor::from(cout, String::new())));
+            output::print_buffer(&mut output, &state)?;
+        }
+
+        poll.poll(&mut events, Some(Duration::from_millis(30)))?;
+
+        for event in events.iter() {
+            match event.token() {
+                TERM_EVENT => {
+                    if let Some(term_event) = term_events.next() {
+                        let term_event = term_event?;
+                        state = match state.mode {
+                            Mode::Execute => {
+                                let cin = format!("{}\n", state.input);
+                                child_send
+                                    .send(child::Message::Exec(cin.clone()))?;
+
+                                state.history.push(Source::ChildInput(
+                                    state.input.to_owned(),
+                                ));
+                                state.mode = Mode::Normal;
+                                state.input = Cursor::new();
+                                state
+                            }
+
+                            Mode::Command => command_mode(term_event, state),
+                            Mode::Insert => insert_mode(term_event, state),
+                            Mode::Normal => normal_mode(term_event, state),
+                            Mode::Quit => break 'main,
+                        };
+
+                        output::print_buffer(&mut output, &state)?;
+
+                        state = match state.mode {
+                            Mode::Execute => {
+                                let cin = format!("{}\n", state.input);
+                                child_send
+                                    .send(child::Message::Exec(cin.clone()))?;
+
+                                state.history.push(Source::ChildInput(
+                                    state.input.to_owned(),
+                                ));
+                                state.mode = Mode::Normal;
+                                state.input = Cursor::new();
+                                state
+                            }
+                            Mode::Quit => break 'main,
+                            _ => {
+                                child_send.send(child::Message::Input(
+                                    state.input.clone(),
+                                ))?;
+                                state
+                            }
+                        };
+                    }
+                }
+                _ => break 'main,
+            }
+        }
+    }
+
     // loop {
+    /*
     for event in term_in.events() {
         let event = event?;
         state = match state.mode {
             Mode::Execute => {
-                let cin =
-                    format!("{}{}\n", state.input_before, state.input_after);
+                let cin = format!("{}\n", state.input);
+                child_send.send(child::Message::Exec(cin.clone()))?;
 
-                child_send.send(child::Message::Exec(cin))?;
-
-                State {
-                    mode: Mode::Normal,
-                    input_before: String::new(),
-                    input_after: String::new(),
-                    ..state
-                }
+                state.history.push(state.input.to_owned());
+                state.mode = Mode::Normal;
+                state.input = Cursor::new();
+                state
             }
+
             Mode::Command => command_mode(event, state),
             Mode::Insert => insert_mode(event, state),
             Mode::Normal => normal_mode(event, state),
             Mode::Quit => break,
         };
 
-        print_buffer(&mut output, &state)?;
+        // output::print_buffer(&mut output, &state)?;
 
         state = match state.mode {
             Mode::Execute => {
-                let cin =
-                    format!("{}{}\n", state.input_before, state.input_after);
+                let cin = format!("{}\n", state.input);
+                child_send.send(child::Message::Exec(cin.clone()))?;
 
-                child_send.send(child::Message::Exec(cin))?;
-
-                State {
-                    mode: Mode::Normal,
-                    input_before: String::new(),
-                    input_after: String::new(),
-                    ..state
-                }
+                state.history.push(state.input.to_owned());
+                state.mode = Mode::Normal;
+                state.input = Cursor::new();
+                state
             }
             Mode::Quit => break,
-            _ => state,
-        }
+            _ => {
+                child_send.send(child::Message::Input(state.input.clone()))?;
+                state
+            }
+        };
+
+        /*
+        let cloned = state.clone();
+        handle.spawn(async move {
+            print_buffer(OutputType::Input(cloned)).await.unwrap();
+        });
+        */
     }
+    */
 
     child_send.send(child::Message::Kill)?;
     output_t.join().unwrap()?;
+    drop(output);
 
-    write!(
-        output,
-        "\n{}{}finished\n\r",
-        clear::CurrentLine,
-        cursor::Goto(1, state.size.1),
-    )?;
-    output.flush()?;
+    println!("\nfinished\n\n",);
 
-    Ok(())
-}
-
-fn print_buffer(
-    output: &mut Stdout,
-    state: &State,
-) -> Result<(), std::io::Error> {
-    write!(output, "{clear_all}", clear_all = clear::All,)?;
-    for (i, o) in state.output.iter().enumerate() {
-        write!(
-            output,
-            "{output_pos}",
-            output_pos = cursor::Goto(1, 1 + i as u16)
-        )?;
-        write!(output, "{}", o).unwrap();
-    }
-    write!(
-        output,
-        "{state_pos}: {state_mode:?}{command_pos}command: {command}{before_pos}{before}{after}{cursor_pos}",
-        state_pos = cursor::Goto(1, state.size.1 - 2),
-        state_mode = state.mode,
-        command_pos = cursor::Goto(1, state.size.1 - 1),
-        command = format!("{}{}", state.cmd_before, state.cmd_after),
-        before_pos = cursor::Goto(1, state.size.1),
-        before = state.input_before,
-        after = state.input_after,
-        cursor_pos = cursor::Goto(state.input_before.len() as u16 + 1, state.size.1),
-    )?;
-    output.flush()?;
     Ok(())
 }
