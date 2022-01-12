@@ -38,6 +38,8 @@ pub fn get_config(_con_f: &str) -> std::io::Result<HashMap<String, String>> {
     config.insert("I".to_string(), "InsertStart".to_string());
     config.insert("a".to_string(), "Append".to_string());
     config.insert("A".to_string(), "AppendEnd".to_string());
+    config.insert("C".to_string(), "ClearAfterCursor".to_string());
+    config.insert("s".to_string(), "DeletePosInsert".to_string());
     config.insert("S".to_string(), "DeleteLineInsert".to_string());
     config.insert("q".to_string(), "Quit".to_string());
     Ok(config)
