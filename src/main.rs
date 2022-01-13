@@ -98,7 +98,7 @@ fn main() -> Result<(), Box<dyn error::Error + 'static>> {
             output::print_buffer(&mut output, &state)?;
         }
 
-        poll.poll(&mut events, Some(Duration::from_millis(30)))?;
+        poll.poll(&mut events, Some(Duration::from_nanos(30)))?;
 
         for event in events.iter() {
             match event.token() {
