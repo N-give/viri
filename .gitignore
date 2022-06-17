@@ -1,2 +1,5 @@
 /target
 /.vscode
+/.direnv
+.envrc
+/result-bin
