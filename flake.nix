@@ -18,7 +18,7 @@
       };
 
       rustPkgs = pkgs.rustBuilder.makePackageSet {
-        rustVersion = "1.61.0";
+        rustChannel = "nightly";
         packageFun = import ./Cargo.nix;
       };
     in rec {
